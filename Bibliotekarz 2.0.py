@@ -4,10 +4,39 @@ import requests
 import time
 import re
 import io
+import json
 import xml.etree.ElementTree as ET
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Bibliotekarz 2.0", page_icon="📖", layout="wide")
+st.set_page_config(page_title="Bibliotekarz Pro", page_icon="📖", layout="wide")
+
+# --- INTEGRACJA GA4 ---
+GOOGLE_ANALYTICS_ID = "G-EYLDFL816H"
+
+def inject_ga(ga_id):
+    if ga_id.startswith("G-XXXX"): return 
+    js = f"""
+    <script>
+    var parentHead = window.parent.document.head;
+    if (!parentHead.querySelector('script[src*="gtag/js?id={ga_id}"]')) {{
+        var script = window.parent.document.createElement('script');
+        script.async = true;
+        script.src = 'https://www.googletagmanager.com/gtag/js?id={ga_id}';
+        parentHead.appendChild(script);
+        var script2 = window.parent.document.createElement('script');
+        script2.innerHTML = `
+            window.parent.dataLayer = window.parent.dataLayer || [];
+            function gtag(){{window.parent.dataLayer.push(arguments);}}
+            gtag('js', new Date());
+            gtag('config', '{ga_id}');
+        `;
+        parentHead.appendChild(script2);
+    }}
+    </script>
+    """
+    st.components.v1.html(js, height=0, width=0)
+
+inject_ga(GOOGLE_ANALYTICS_ID)
 
 # --- SŁOWNIK JĘZYKÓW ---
 LANG_MAP = {
@@ -16,7 +45,7 @@ LANG_MAP = {
     "spa": "hiszpański", "lat": "łacina", "cze": "czeski", "ukr": "ukraiński"
 }
 
-# --- POBIERANIE POŚWIADCZEŃ Z SECRETS ---
+# --- POŚWIADCZENIA ---
 try:
     ELIBRI_USER = st.secrets["elibri"]["username"]
     ELIBRI_PASS = st.secrets["elibri"]["password"]
@@ -33,8 +62,7 @@ def reverse_authors(authors_str):
     for part in parts:
         name_atoms = part.strip().split()
         if len(name_atoms) >= 2:
-            last_name = name_atoms[-1]
-            first_names = " ".join(name_atoms[:-1])
+            last_name = name_atoms[-1]; first_names = " ".join(name_atoms[:-1])
             reversed_parts.append(f"{last_name} {first_names}")
         else:
             reversed_parts.append(part.strip())
@@ -49,7 +77,7 @@ def format_date(date_str):
         return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
     return date_str
 
-# --- 1. PARSER eLibri (ONIX) ---
+# --- PARSER ONIX (ELIBRI) ---
 def parse_onix_data(xml_content):
     try:
         xml_content_str = xml_content.decode('utf-8') if isinstance(xml_content, bytes) else xml_content
@@ -61,19 +89,40 @@ def parse_onix_data(xml_content):
         isbn13 = find_text(product, './/ProductIdentifier[ProductIDType="15"]/IDValue') or "Brak"
         title = find_text(product, './/TitleDetail[TitleType="01"]//TitleText') or "Brak tytułu"
         
-        authors = [contrib.find('PersonName').text for contrib in product.findall('.//Contributor') if contrib.find('PersonName') is not None]
+        authors = []
+        for contrib in product.findall('.//Contributor'):
+            name = find_text(contrib, 'PersonName')
+            if name: authors.append(name)
         authors_str = ", ".join(authors) if authors else "Nieznany"
 
+        series_names = []
+        for series in product.findall('.//Collection'):
+            s_title = find_text(series, './/TitleText')
+            if s_title: series_names.append(s_title)
+        series_str = ", ".join(series_names) if series_names else "Brak serii"
+
         desc_detail = product.find('DescriptiveDetail')
-        edition, pages, language, oprawa = "Brak", "Brak", "Brak", "Nieznana"
+        edition_display, pages, language_display, categories, oprawa = "Brak", "Brak", "Brak", [], "Nieznana"
         
         if desc_detail is not None:
-            pages = find_text(desc_detail, './/Extent[ExtentType="00"]/ExtentValue') or "Brak"
+            ed_stat = find_text(desc_detail, 'EditionStatement')
+            if ed_stat: edition_display = "Pierwsze" if ed_stat == "1" else ed_stat
+            pages = find_text(desc_detail, './/Extent[ExtentType="00"]/ExtentValue')
             p_form = find_text(desc_detail, 'ProductForm')
-            oprawa = "Twarda" if p_form == "BB" else "Miękka"
+            p_detail = find_text(desc_detail, 'ProductFormDetail')
+            if p_form == "BC": oprawa = "Miękka ze skrzydełkami" if p_detail == "B504" else "Miękka"
+            elif p_form == "BB": oprawa = "Twarda"
             lang_node = desc_detail.find('.//Language[LanguageRole="01"]/LanguageCode')
             if lang_node is not None:
-                language = LANG_MAP.get(lang_node.text.strip().lower(), lang_node.text.upper())
+                l_code = lang_node.text.strip().lower()
+                language_display = LANG_MAP.get(l_code, l_code.upper())
+            for subject in desc_detail.findall('.//Subject'):
+                cat_text = find_text(subject, 'SubjectHeadingText')
+                if cat_text: categories.append(cat_text)
+        categories_str = " | ".join(list(dict.fromkeys(categories))) if categories else "Brak kategorii"
+
+        pub_date_raw = find_text(product, './/PublishingDate[PublishingDateRole="01"]/Date')
+        release_date = format_date(pub_date_raw) or "Brak daty"
 
         description = "Brak opisu"
         text_content = product.find('.//TextContent[TextType="03"]/Text')
@@ -85,137 +134,121 @@ def parse_onix_data(xml_content):
         if res_link is not None: cover_url = res_link.text
 
         publisher = find_text(product, './/Publisher/PublisherName') or "Brak"
+        imprint = find_text(product, './/Imprint/ImprintName') or "Brak"
+        
+        price_str = "Brak"
+        price_node = product.find('.//Price[PriceType="02"]')
+        if price_node is not None:
+            price_str = f"{find_text(price_node, 'PriceAmount')} {find_text(price_node, 'CurrencyCode')}"
 
         return {
             "Tytuł": title, "Autorzy": authors_str, "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
-            "Oprawa": oprawa, "Język": language, "Kategoria": "Baza eLibri", 
-            "Data premiery": format_date(find_text(product, './/PublishingDate/Date')),
-            "Seria": "Standard", "Opis wydania": "eLibri", "Wydawca": publisher, 
-            "Imprint": "Brak", "Liczba stron": pages, "ISBN-13": isbn13, "Cena": "n/d", 
-            "Opis": description, "Link do okładki": cover_url
+            "Oprawa": oprawa, "Język": language_display, "Kategoria": categories_str, "Data premiery": release_date,
+            "Seria": series_str, "Opis wydania": edition_display, "Wydawca": publisher, "Imprint": imprint,
+            "Liczba stron": pages, "ISBN-13": isbn13, "Cena": price_str, "Opis": description, "Link do okładki": cover_url
         }
-    except: return None
+    except Exception: return None
 
-# --- 2. OBSŁUGA OPEN LIBRARY ---
+# --- OBSŁUGA OPEN LIBRARY ---
 def fetch_open_library(isbn):
     try:
-        r = requests.get(f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data", timeout=10)
-        if r.status_code == 200 and r.json():
-            data = r.json().get(f"ISBN:{isbn}")
-            if not data: return None
-            auths = ", ".join([a.get('name') for a in data.get('authors', [])]) or "Nieznany"
-            return {
-                "Tytuł": data.get('title', "Brak tytułu"), "Autorzy": auths, "Autorzy (Nazwisko Imię)": reverse_authors(auths),
-                "Oprawa": "Brak danych (OL)", "Język": "Brak danych (OL)", "Kategoria": "OpenLibrary", 
-                "Data premiery": data.get('publish_date', "Brak"),
-                "Seria": "Baza OL", "Opis wydania": "Brak", 
-                "Wydawca": ", ".join([p.get('name') for p in data.get('publishers', [])]), 
-                "Imprint": "Brak", "Liczba stron": str(data.get('number_of_pages', "Brak")), 
-                "ISBN-13": isbn, "Cena": "n/d", "Opis": "Dane z OpenLibrary", 
-                "Link do okładki": data.get('cover', {}).get('large', "Brak okładki")
-            }
-    except: return None
-
-# --- 3. OBSŁUGA DOAB (PRISM API - WERSJA UŻYTKOWNIKA) ---
-def fetch_doab(isbn):
-    try:
-        # Usuwamy myślniki i spacji dla pewności
-        clean_isbn = re.sub(r'[-\s]', '', str(isbn))
-        url = f"https://directory.doabooks.org/rest/peerReviews?isbn={clean_isbn}"
-        
-        # Nagłówki udające przeglądarkę
-        headers = {
-            'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        r = requests.get(url, headers=headers, timeout=15)
-        
+        url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
+        r = requests.get(url, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            if not data or len(data) == 0: return None
-            
-            # Pobieramy info o recenzji i przedmiocie
-            review_info = data[0]
-            item = review_info.get('item', {})
-            metadata_list = item.get('metadata', [])
-            
-            # Słownik metadanych
-            meta = {m['key']: m['value'] for m in metadata_list}
-            
-            # Autorzy
-            authors_list = [m['value'] for m in metadata_list if m['key'] == 'dc.contributor.author']
-            authors_str = ", ".join(authors_list) if authors_list else "Nieznany"
-
-            return {
-                "Tytuł": meta.get('dc.title', "Tytuł z PRISM"),
-                "Autorzy": authors_str,
-                "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
-                "Oprawa": "Digital OA", "Język": meta.get('dc.language.iso', "Brak danych"),
-                "Kategoria": "Recenzowane (PRISM)", "Data premiery": meta.get('dc.date.issued', "Brak"),
-                "Seria": f"Typ: {review_info.get('type', 'Brak')}", "Opis wydania": "DOAB PRISM",
-                "Wydawca": meta.get('dc.publisher', "Brak"), "Imprint": "Brak", "Liczba stron": "n/d",
-                "ISBN-13": isbn, "Cena": "0.00", 
-                "Opis": meta.get('dc.description.abstract', "Brak opisu w PRISM"),
-                "Link do okładki": f"https://directory.doabooks.org/handle/{item.get('handle', '')}"
-            }
+            key = f"ISBN:{isbn}"
+            if key in data:
+                b = data[key]
+                
+                # Standaryzacja autorów
+                authors = [a.get('name') for a in b.get('authors', [])]
+                authors_str = ", ".join(authors) if authors else "Nieznany"
+                
+                # Standaryzacja języka
+                langs = b.get('subjects', []) # OpenLibrary często trzyma język w subjects lub oddzielnie
+                # Jeśli API nie zwraca jasnego kodu języka, ustawiamy "Brak / Angielski (OL)"
+                
+                return {
+                    "Tytuł": b.get('title', "Brak tytułu"),
+                    "Autorzy": authors_str,
+                    "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
+                    "Oprawa": "Brak danych (OL)",
+                    "Język": "Brak danych (OL)",
+                    "Kategoria": " | ".join([s.get('name') for s in b.get('subjects', [])[:3]]) if b.get('subjects') else "Brak",
+                    "Data premiery": b.get('publish_date', "Brak daty"),
+                    "Seria": "Brak danych (OL)",
+                    "Opis wydania": "Brak danych (OL)",
+                    "Wydawca": ", ".join([p.get('name') for p in b.get('publishers', [])]) if b.get('publishers') else "Brak",
+                    "Imprint": "Brak",
+                    "Liczba stron": str(b.get('number_of_pages', "Brak")),
+                    "ISBN-13": isbn,
+                    "Cena": "Nie dotyczy (OL)",
+                    "Opis": b.get('notes', "Brak opisu"),
+                    "Link do okładki": b.get('cover', {}).get('large', "Brak okładki")
+                }
         return None
     except: return None
 
-# --- LOGIKA KASKADOWA ---
-def get_book_data_cascading(isbn):
-    # 1. eLibri
+# --- GŁÓWNA LOGIKA POBIERANIA ---
+def get_book_data(isbn):
+    # 1. Próba eLibri
+    url_elibri = f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}"
     try:
-        r = requests.get(f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}", 
-                         auth=(ELIBRI_USER, ELIBRI_PASS), timeout=10)
+        r = requests.get(url_elibri, auth=(ELIBRI_USER, ELIBRI_PASS), timeout=10)
         if r.status_code == 200:
             data = parse_onix_data(r.content)
             if data: return data, "eLibri"
     except: pass
 
-    # 2. OpenLibrary
-    ol = fetch_open_library(isbn)
-    if ol: return ol, "OpenLibrary"
-
-    # 3. DOAB (PRISM)
-    doab = fetch_doab(isbn)
-    if doab: return doab, "DOAB"
-
+    # 2. Próba OpenLibrary
+    ol_data = fetch_open_library(isbn)
+    if ol_data:
+        return ol_data, "OpenLibrary"
+    
     return None, "Brak"
 
-# --- INTERFEJS STREAMLIT ---
-st.title("📖 Bibliotekarz 2.0")
-st.markdown("### Multibaza: eLibri ➔ OpenLibrary ➔ DOAB (PRISM)")
+# --- UI STREAMLIT ---
+st.title("📖 Multibaza Książkowa (eLibri + OpenLibrary)")
 
 uploaded_file = st.file_uploader("Załaduj plik Excel z kolumną ISBN", type=["xlsx"])
 
 if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    col = st.selectbox("Wybierz kolumnę z ISBN:", df.columns)
+    df_in = pd.read_excel(uploaded_file)
+    target_col = st.selectbox("Wybierz kolumnę z numerami ISBN:", df_in.columns)
     
-    if st.button("Pobierz dane (Kaskadowo)"):
-        results = []
-        bar = st.progress(0)
+    if st.button("Pobierz dane z API"):
+        final_data = []
+        progress_bar = st.progress(0)
         
-        headers = ["Tytuł", "Autorzy", "Autorzy (Nazwisko Imię)", "Oprawa", "Język", "Kategoria", 
-                   "Data premiery", "Seria", "Opis wydania", "Wydawca", "Imprint", 
-                   "Liczba stron", "ISBN-13", "Cena", "Opis", "Link do okładki"]
+        headers = [
+            "Tytuł", "Autorzy", "Autorzy (Nazwisko Imię)", "Oprawa", "Język", "Kategoria", 
+            "Data premiery", "Seria", "Opis wydania", "Wydawca", "Imprint", 
+            "Liczba stron", "ISBN-13", "Cena", "Opis", "Link do okładki"
+        ]
         
-        for i, row in df.iterrows():
-            isbn = str(row[col]).split('.')[0].strip()
-            data, source = get_book_data_cascading(isbn)
+        for i, row in df_in.iterrows():
+            isbn_raw = str(row[target_col]).split('.')[0].strip()
             
-            entry = {"ISBN wejściowy": isbn, "Źródło": source}
+            book_info, source = get_book_data(isbn_raw)
+            
+            entry = {"Identyfikator": isbn_raw, "Źródło danych": source}
+            
             for h in headers:
-                entry[h] = data.get(h, "Brak") if data else "Brak danych"
-            results.append(entry)
-            bar.progress((i + 1) / len(df))
-            time.sleep(0.1)
+                if book_info:
+                    entry[h] = book_info.get(h, "Brak")
+                else:
+                    entry[h] = "Nie znaleziono w żadnej bazie"
             
-        res_df = pd.DataFrame(results)
-        st.dataframe(res_df)
-        
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            res_df.to_excel(writer, index=False)
-        st.download_button("📥 Pobierz kompletny raport Excel", output.getvalue(), "bibliotekarz_2.0_export.xlsx")
+            final_data.append(entry)
+            progress_bar.progress((i + 1) / len(df_in))
+            time.sleep(0.1) # Lekki throttle dla API
+
+        st.session_state.results_df = pd.DataFrame(final_data)
+        st.success("Przetwarzanie zakończone!")
+
+if 'results_df' in st.session_state:
+    st.dataframe(st.session_state.results_df)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        st.session_state.results_df.to_excel(writer, index=False)
+    st.download_button("📥 Pobierz kompletny Excel", buf.getvalue(), "rejestr_ksiazek.xlsx")
