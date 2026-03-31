@@ -90,8 +90,8 @@ def parse_onix_data(xml_content):
             "Tytuł": title, "Autorzy": authors_str, "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
             "Oprawa": oprawa, "Język": language, "Kategoria": "Baza eLibri", 
             "Data premiery": format_date(find_text(product, './/PublishingDate/Date')),
-            "Seria": "Brak", "Opis wydania": "Standard", "Wydawca": publisher, 
-            "Imprint": "Brak", "Liczba stron": pages, "ISBN-13": isbn13, "Cena": "Sprawdź w eLibri", 
+            "Seria": "Standard", "Opis wydania": "eLibri", "Wydawca": publisher, 
+            "Imprint": "Brak", "Liczba stron": pages, "ISBN-13": isbn13, "Cena": "n/d", 
             "Opis": description, "Link do okładki": cover_url
         }
     except: return None
@@ -108,7 +108,7 @@ def fetch_open_library(isbn):
                 "Tytuł": data.get('title', "Brak tytułu"), "Autorzy": auths, "Autorzy (Nazwisko Imię)": reverse_authors(auths),
                 "Oprawa": "Brak danych (OL)", "Język": "Brak danych (OL)", "Kategoria": "OpenLibrary", 
                 "Data premiery": data.get('publish_date', "Brak"),
-                "Seria": "Brak", "Opis wydania": "Brak", 
+                "Seria": "Baza OL", "Opis wydania": "Brak", 
                 "Wydawca": ", ".join([p.get('name') for p in data.get('publishers', [])]), 
                 "Imprint": "Brak", "Liczba stron": str(data.get('number_of_pages', "Brak")), 
                 "ISBN-13": isbn, "Cena": "n/d", "Opis": "Dane z OpenLibrary", 
@@ -116,55 +116,55 @@ def fetch_open_library(isbn):
             }
     except: return None
 
-# --- 3. OBSŁUGA DOAB (Pancerna Wersja Dwuetapowa) ---
+# --- 3. OBSŁUGA DOAB (PRISM API - WERSJA UŻYTKOWNIKA) ---
 def fetch_doab(isbn):
     try:
+        # Usuwamy myślniki i spacji dla pewności
         clean_isbn = re.sub(r'[-\s]', '', str(isbn))
-        # KROK 1: Szukamy ID obiektu po ISBN
-        search_url = f"https://directory.doabooks.org/rest/search?query={clean_isbn}"
-        r = requests.get(search_url, headers={'Accept': 'application/json'}, timeout=15)
+        url = f"https://directory.doabooks.org/rest/peerReviews?isbn={clean_isbn}"
         
-        if r.status_code == 200 and r.json():
-            item = r.json()[0]
-            item_id = item.get('id')
-            handle = item.get('handle', '')
+        # Nagłówki udające przeglądarkę
+        headers = {
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        r = requests.get(url, headers=headers, timeout=15)
+        
+        if r.status_code == 200:
+            data = r.json()
+            if not data or len(data) == 0: return None
             
-            # KROK 2: Pobieramy PEŁNE metadane dla tego ID
-            item_url = f"https://directory.doabooks.org/rest/items/{item_id}/metadata"
-            r_meta = requests.get(item_url, headers={'Accept': 'application/json'}, timeout=10)
+            # Pobieramy info o recenzji i przedmiocie
+            review_info = data[0]
+            item = review_info.get('item', {})
+            metadata_list = item.get('metadata', [])
             
-            if r_meta.status_code == 200:
-                metadata_list = r_meta.json()
-                meta = {}
-                for m in metadata_list:
-                    k, v = m.get('key'), m.get('value')
-                    if k not in meta: meta[k] = []
-                    meta[k].append(v)
-                
-                title = meta.get('dc.title', ["Brak tytułu"])[0]
-                authors = ", ".join(meta.get('dc.contributor.author', ["Nieznany"]))
-                publisher = meta.get('dc.publisher', ["Brak wydawcy"])[0]
-                date = meta.get('dc.date.issued', ["Brak daty"])[0]
-                desc = meta.get('dc.description.abstract', meta.get('dc.description', ["Brak opisu"]))[0]
-                lang = meta.get('dc.language.iso', ["Brak języka"])[0]
+            # Słownik metadanych
+            meta = {m['key']: m['value'] for m in metadata_list}
+            
+            # Autorzy
+            authors_list = [m['value'] for m in metadata_list if m['key'] == 'dc.contributor.author']
+            authors_str = ", ".join(authors_list) if authors_list else "Nieznany"
 
-                return {
-                    "Tytuł": title,
-                    "Autorzy": authors,
-                    "Autorzy (Nazwisko Imię)": reverse_authors(authors),
-                    "Oprawa": "Digital Open Access", "Język": lang,
-                    "Kategoria": "DOAB / Science", "Data premiery": date,
-                    "Seria": "Baza DOAB", "Opis wydania": "Open Access",
-                    "Wydawca": publisher, "Imprint": "Brak", "Liczba stron": "n/d",
-                    "ISBN-13": isbn, "Cena": "0.00", "Opis": desc,
-                    "Link do okładki": f"https://directory.doabooks.org/handle/{handle}"
-                }
+            return {
+                "Tytuł": meta.get('dc.title', "Tytuł z PRISM"),
+                "Autorzy": authors_str,
+                "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
+                "Oprawa": "Digital OA", "Język": meta.get('dc.language.iso', "Brak danych"),
+                "Kategoria": "Recenzowane (PRISM)", "Data premiery": meta.get('dc.date.issued', "Brak"),
+                "Seria": f"Typ: {review_info.get('type', 'Brak')}", "Opis wydania": "DOAB PRISM",
+                "Wydawca": meta.get('dc.publisher', "Brak"), "Imprint": "Brak", "Liczba stron": "n/d",
+                "ISBN-13": isbn, "Cena": "0.00", 
+                "Opis": meta.get('dc.description.abstract', "Brak opisu w PRISM"),
+                "Link do okładki": f"https://directory.doabooks.org/handle/{item.get('handle', '')}"
+            }
         return None
     except: return None
 
 # --- LOGIKA KASKADOWA ---
 def get_book_data_cascading(isbn):
-    # 1. ELIBRI
+    # 1. eLibri
     try:
         r = requests.get(f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}", 
                          auth=(ELIBRI_USER, ELIBRI_PASS), timeout=10)
@@ -173,19 +173,19 @@ def get_book_data_cascading(isbn):
             if data: return data, "eLibri"
     except: pass
 
-    # 2. OPENLIBRARY
+    # 2. OpenLibrary
     ol = fetch_open_library(isbn)
     if ol: return ol, "OpenLibrary"
 
-    # 3. DOAB
+    # 3. DOAB (PRISM)
     doab = fetch_doab(isbn)
     if doab: return doab, "DOAB"
 
-    return None, "Nie znaleziono"
+    return None, "Brak"
 
 # --- INTERFEJS STREAMLIT ---
 st.title("📖 Bibliotekarz 2.0")
-st.markdown("### Pobieranie danych: eLibri ➔ OpenLibrary ➔ DOAB")
+st.markdown("### Multibaza: eLibri ➔ OpenLibrary ➔ DOAB (PRISM)")
 
 uploaded_file = st.file_uploader("Załaduj plik Excel z kolumną ISBN", type=["xlsx"])
 
