@@ -116,39 +116,50 @@ def fetch_open_library(isbn):
             }
     except: return None
 
-# --- 3. OBSŁUGA DOAB (Poprawiona kaskada wyszukiwania) ---
+# --- 3. OBSŁUGA DOAB (Pancerna Wersja Dwuetapowa) ---
 def fetch_doab(isbn):
     try:
         clean_isbn = re.sub(r'[-\s]', '', str(isbn))
-        # Szukamy pełnych metadanych przez REST Search
-        url = f"https://directory.doabooks.org/rest/search?query=dc.identifier.isbn:{clean_isbn}&expand=metadata"
-        r = requests.get(url, headers={'Accept': 'application/json'}, timeout=15)
+        # KROK 1: Szukamy ID obiektu po ISBN
+        search_url = f"https://directory.doabooks.org/rest/search?query={clean_isbn}"
+        r = requests.get(search_url, headers={'Accept': 'application/json'}, timeout=15)
         
         if r.status_code == 200 and r.json():
-            book = r.json()[0]
-            metadata_list = book.get('metadata', [])
+            item = r.json()[0]
+            item_id = item.get('id')
+            handle = item.get('handle', '')
             
-            # Tworzymy mapę metadanych dla łatwiejszego dostępu
-            meta = {}
-            for m in metadata_list:
-                key = m.get('key')
-                if key not in meta: meta[key] = []
-                meta[key].append(m.get('value'))
+            # KROK 2: Pobieramy PEŁNE metadane dla tego ID
+            item_url = f"https://directory.doabooks.org/rest/items/{item_id}/metadata"
+            r_meta = requests.get(item_url, headers={'Accept': 'application/json'}, timeout=10)
             
-            auths = ", ".join(meta.get('dc.contributor.author', ["Nieznany"]))
-            
-            return {
-                "Tytuł": meta.get('dc.title', ["Brak tytułu"])[0],
-                "Autorzy": auths,
-                "Autorzy (Nazwisko Imię)": reverse_authors(auths),
-                "Oprawa": "Digital OA", "Język": meta.get('dc.language.iso', ["Brak"])[0],
-                "Kategoria": "DOAB Open Access", "Data premiery": meta.get('dc.date.issued', ["Brak"])[0],
-                "Seria": "Brak", "Opis wydania": "Open Access",
-                "Wydawca": meta.get('dc.publisher', ["Brak"])[0], "Imprint": "Brak", "Liczba stron": "Brak",
-                "ISBN-13": isbn, "Cena": "0.00", 
-                "Opis": meta.get('dc.description.abstract', ["Brak opisu"])[0],
-                "Link do okładki": f"https://directory.doabooks.org/handle/{book.get('handle')}"
-            }
+            if r_meta.status_code == 200:
+                metadata_list = r_meta.json()
+                meta = {}
+                for m in metadata_list:
+                    k, v = m.get('key'), m.get('value')
+                    if k not in meta: meta[k] = []
+                    meta[k].append(v)
+                
+                title = meta.get('dc.title', ["Brak tytułu"])[0]
+                authors = ", ".join(meta.get('dc.contributor.author', ["Nieznany"]))
+                publisher = meta.get('dc.publisher', ["Brak wydawcy"])[0]
+                date = meta.get('dc.date.issued', ["Brak daty"])[0]
+                desc = meta.get('dc.description.abstract', meta.get('dc.description', ["Brak opisu"]))[0]
+                lang = meta.get('dc.language.iso', ["Brak języka"])[0]
+
+                return {
+                    "Tytuł": title,
+                    "Autorzy": authors,
+                    "Autorzy (Nazwisko Imię)": reverse_authors(authors),
+                    "Oprawa": "Digital Open Access", "Język": lang,
+                    "Kategoria": "DOAB / Science", "Data premiery": date,
+                    "Seria": "Baza DOAB", "Opis wydania": "Open Access",
+                    "Wydawca": publisher, "Imprint": "Brak", "Liczba stron": "n/d",
+                    "ISBN-13": isbn, "Cena": "0.00", "Opis": desc,
+                    "Link do okładki": f"https://directory.doabooks.org/handle/{handle}"
+                }
+        return None
     except: return None
 
 # --- LOGIKA KASKADOWA ---
@@ -170,11 +181,11 @@ def get_book_data_cascading(isbn):
     doab = fetch_doab(isbn)
     if doab: return doab, "DOAB"
 
-    return None, "Brak"
+    return None, "Nie znaleziono"
 
 # --- INTERFEJS STREAMLIT ---
 st.title("📖 Bibliotekarz 2.0")
-st.markdown("### Multibaza: eLibri ➔ OpenLibrary ➔ DOAB")
+st.markdown("### Pobieranie danych: eLibri ➔ OpenLibrary ➔ DOAB")
 
 uploaded_file = st.file_uploader("Załaduj plik Excel z kolumną ISBN", type=["xlsx"])
 
@@ -182,7 +193,7 @@ if uploaded_file:
     df = pd.read_excel(uploaded_file)
     col = st.selectbox("Wybierz kolumnę z ISBN:", df.columns)
     
-    if st.button("Uruchom pobieranie danych"):
+    if st.button("Pobierz dane (Kaskadowo)"):
         results = []
         bar = st.progress(0)
         
@@ -196,7 +207,7 @@ if uploaded_file:
             
             entry = {"ISBN wejściowy": isbn, "Źródło": source}
             for h in headers:
-                entry[h] = data.get(h, "Nie znaleziono") if data else "Nie znaleziono"
+                entry[h] = data.get(h, "Brak") if data else "Brak danych"
             results.append(entry)
             bar.progress((i + 1) / len(df))
             time.sleep(0.1)
