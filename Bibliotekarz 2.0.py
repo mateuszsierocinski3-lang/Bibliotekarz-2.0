@@ -211,4 +211,70 @@ def get_book_data_cascading(isbn):
     # 1. ELIBRI (Najwyższy priorytet)
     url_el = f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}"
     try:
-        r = requests.get(url_el, auth=(ELIBRI_USER,
+        r = requests.get(url_el, auth=(ELIBRI_USER, ELIBRI_PASS), timeout=10)
+        if r.status_code == 200:
+            data = parse_onix_data(r.content)
+            if data and data.get("Tytuł") != "Brak tytułu":
+                return data, "eLibri"
+    except: pass
+
+    # 2. OPENLIBRARY
+    ol_data = fetch_open_library(isbn)
+    if ol_data:
+        return ol_data, "OpenLibrary"
+
+    # 3. DOAB
+    doab_data = fetch_doab(isbn)
+    if doab_data:
+        return doab_data, "DOAB"
+
+    return None, "Nie znaleziono"
+
+# --- INTERFEJS STREAMLIT ---
+st.title("📖 Bibliotekarz Pro V3 (eLibri -> OL -> DOAB)")
+
+uploaded_file = st.file_uploader("Załaduj plik Excel z kolumną ISBN", type=["xlsx"])
+
+if uploaded_file:
+    df_in = pd.read_excel(uploaded_file)
+    target_col = st.selectbox("Wybierz kolumnę z numerami ISBN:", df_in.columns)
+    
+    if st.button("Pobierz dane (Kaskadowo)"):
+        final_data = []
+        progress_bar = st.progress(0)
+        
+        # Definicja stałych nagłówków dla zachowania standardu
+        headers = [
+            "Tytuł", "Autorzy", "Autorzy (Nazwisko Imię)", "Oprawa", "Język", "Kategoria", 
+            "Data premiery", "Seria", "Opis wydania", "Wydawca", "Imprint", 
+            "Liczba stron", "ISBN-13", "Cena", "Opis", "Link do okładki"
+        ]
+        
+        for i, row in df_in.iterrows():
+            isbn_raw = str(row[target_col]).split('.')[0].strip()
+            
+            # Pobieranie danych z zachowaniem priorytetów
+            book_info, source = get_book_data_cascading(isbn_raw)
+            
+            entry = {"Identyfikator": isbn_raw, "Źródło": source}
+            
+            # Wypełnianie kolumn danymi lub informacją o braku
+            for h in headers:
+                if book_info:
+                    entry[h] = book_info.get(h, "Brak")
+                else:
+                    entry[h] = "Brak danych"
+            
+            final_data.append(entry)
+            progress_bar.progress((i + 1) / len(df_in))
+            time.sleep(0.1)
+
+        st.session_state.results_df = pd.DataFrame(final_data)
+        st.success("Przetwarzanie zakończone sukcesem!")
+
+if 'results_df' in st.session_state:
+    st.dataframe(st.session_state.results_df)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        st.session_state.results_df.to_excel(writer, index=False)
+    st.download_button("📥 Pobierz kompletny raport Excel", buf.getvalue(), "raport_ksiazek_v3.xlsx")
