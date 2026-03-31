@@ -8,7 +8,7 @@ import json
 import xml.etree.ElementTree as ET
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Bibliotekarz Pro", page_icon="📖", layout="wide")
+st.set_page_config(page_title="Bibliotekarz Pro 2.0", page_icon="📖", layout="wide")
 
 # --- SŁOWNIK JĘZYKÓW ---
 LANG_MAP = {
@@ -49,7 +49,7 @@ def format_date(date_str):
         return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
     return date_str
 
-# --- 1. PEŁNY PARSER ONIX (ELIBRI) ---
+# --- 1. PARSER ELIBRI (ONIX) ---
 def parse_onix_data(xml_content):
     try:
         xml_content_str = xml_content.decode('utf-8') if isinstance(xml_content, bytes) else xml_content
@@ -91,8 +91,8 @@ def parse_onix_data(xml_content):
             for subject in desc_detail.findall('.//Subject'):
                 cat_text = find_text(subject, 'SubjectHeadingText')
                 if cat_text: categories.append(cat_text)
+        
         categories_str = " | ".join(list(dict.fromkeys(categories))) if categories else "Brak kategorii"
-
         pub_date_raw = find_text(product, './/PublishingDate[PublishingDateRole="01"]/Date')
         release_date = format_date(pub_date_raw) or "Brak daty"
 
@@ -108,10 +108,8 @@ def parse_onix_data(xml_content):
         publisher = find_text(product, './/Publisher/PublisherName') or "Brak"
         imprint = find_text(product, './/Imprint/ImprintName') or "Brak"
         
-        price_str = "Brak"
         price_node = product.find('.//Price[PriceType="02"]')
-        if price_node is not None:
-            price_str = f"{find_text(price_node, 'PriceAmount')} {find_text(price_node, 'CurrencyCode')}"
+        price_str = f"{find_text(price_node, 'PriceAmount')} {find_text(price_node, 'CurrencyCode')}" if price_node is not None else "Brak"
 
         return {
             "Tytuł": title, "Autorzy": authors_str, "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
@@ -126,92 +124,76 @@ def fetch_open_library(isbn):
     try:
         url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
         r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            key = f"ISBN:{isbn}"
-            if key in data:
-                b = data[key]
-                auth_list = [a.get('name') for a in b.get('authors', [])]
-                authors_str = ", ".join(auth_list) if auth_list else "Nieznany"
-                
-                # Próba wyciągnięcia opisu (OL ma różną strukturę dla opisu)
-                desc = b.get('notes', "Brak opisu")
-                if isinstance(desc, dict): desc = desc.get('value', "Brak opisu")
-
-                return {
-                    "Tytuł": b.get('title', "Brak tytułu"),
-                    "Autorzy": authors_str,
-                    "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
-                    "Oprawa": "Brak danych (OL)",
-                    "Język": "Brak danych (OL)",
-                    "Kategoria": " | ".join([s.get('name') for s in b.get('subjects', [])[:3]]) if b.get('subjects') else "Baza OL",
-                    "Data premiery": b.get('publish_date', "Brak daty"),
-                    "Seria": "Brak danych (OL)",
-                    "Opis wydania": "Brak danych (OL)",
-                    "Wydawca": ", ".join([p.get('name') for p in b.get('publishers', [])]) if b.get('publishers') else "Brak",
-                    "Imprint": "Brak",
-                    "Liczba stron": str(b.get('number_of_pages', "Brak")),
-                    "ISBN-13": isbn,
-                    "Cena": "n/d",
-                    "Opis": desc,
-                    "Link do okładki": b.get('cover', {}).get('large', "Brak okładki")
-                }
+        if r.status_code == 200 and r.json():
+            data = r.json().get(f"ISBN:{isbn}")
+            if not data: return None
+            
+            authors = ", ".join([a.get('name') for a in data.get('authors', [])]) or "Nieznany"
+            return {
+                "Tytuł": data.get('title', "Brak tytułu"),
+                "Autorzy": authors,
+                "Autorzy (Nazwisko Imię)": reverse_authors(authors),
+                "Oprawa": "Brak danych (OL)",
+                "Język": "Brak danych (OL)",
+                "Kategoria": "Baza OpenLibrary",
+                "Data premiery": data.get('publish_date', "Brak"),
+                "Seria": "Brak", "Opis wydania": "Brak",
+                "Wydawca": ", ".join([p.get('name') for p in data.get('publishers', [])]) or "Brak",
+                "Imprint": "Brak", "Liczba stron": str(data.get('number_of_pages', "Brak")),
+                "ISBN-13": isbn, "Cena": "n/d", "Opis": "Dane z OpenLibrary",
+                "Link do okładki": data.get('cover', {}).get('large', "Brak okładki")
+            }
         return None
     except: return None
 
-# --- 3. OBSŁUGA DOAB ---
+# --- 3. POPRAWIONA OBSŁUGA DOAB (DSpace REST API) ---
 def fetch_doab(isbn):
     try:
-        url = f"https://directory.doabooks.org/rest/search?query=dc.identifier.isbn:{isbn}"
-        headers = {'Accept': 'application/json'}
-        r = requests.get(url, headers=headers, timeout=10)
+        # Używamy oficjalnej składni REST z dokumentacji: expand=metadata
+        search_url = f"https://directory.doabooks.org/rest/search?query=dc.identifier.isbn:%22{isbn}%22&expand=metadata"
+        r = requests.get(search_url, headers={'Accept': 'application/json'}, timeout=15)
+        
         if r.status_code == 200:
             results = r.json()
-            if results:
-                book = results[0]
-                meta_list = book.get('metadata', [])
-                metadata = {}
-                # DOAB metadata to lista słowników, robimy z tego mapę dla wygody
-                for m in meta_list:
-                    key = m.get('key')
-                    val = m.get('value')
-                    if key not in metadata: metadata[key] = []
-                    metadata[key].append(val)
+            if not results: return None
+            
+            book = results[0]
+            metadata_list = book.get('metadata', [])
+            
+            # Helper do wyciągania wartości z listy metadata DOAB
+            def get_meta(key):
+                vals = [m['value'] for m in metadata_list if m['key'] == key]
+                return vals[0] if vals else "Brak"
 
-                title = metadata.get('dc.title', ["Brak tytułu"])[0]
-                authors = metadata.get('dc.contributor.author', ["Nieznany"])
-                authors_str = ", ".join(authors)
-                publisher = metadata.get('dc.publisher', ["Brak"])[0]
-                date = metadata.get('dc.date.issued', ["Brak"])[0]
-                desc = metadata.get('dc.description.abstract', ["Brak opisu"])[0]
+            title = get_meta('dc.title')
+            authors = ", ".join([m['value'] for m in metadata_list if m['key'] == 'dc.contributor.author']) or "Nieznany"
+            publisher = get_meta('dc.publisher')
+            date = get_meta('dc.date.issued')
+            desc = get_meta('dc.description.abstract')
 
-                return {
-                    "Tytuł": title,
-                    "Autorzy": authors_str,
-                    "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
-                    "Oprawa": "Digital (OA)",
-                    "Język": "Brak danych (DOAB)",
-                    "Kategoria": "Open Access / DOAB",
-                    "Data premiery": date,
-                    "Seria": "Brak",
-                    "Opis wydania": "Open Access",
-                    "Wydawca": publisher,
-                    "Imprint": "Brak",
-                    "Liczba stron": "Brak",
-                    "ISBN-13": isbn,
-                    "Cena": "0.00",
-                    "Opis": desc,
-                    "Link do okładki": f"https://directory.doabooks.org/handle/{book.get('handle')}"
-                }
+            return {
+                "Tytuł": title,
+                "Autorzy": authors,
+                "Autorzy (Nazwisko Imię)": reverse_authors(authors),
+                "Oprawa": "Digital (DOAB)",
+                "Język": "Brak (DOAB)",
+                "Kategoria": "Open Access",
+                "Data premiery": date,
+                "Seria": "Brak", "Opis wydania": "Open Access",
+                "Wydawca": publisher, "Imprint": "Brak", "Liczba stron": "Brak",
+                "ISBN-13": isbn, "Cena": "0.00", "Opis": desc,
+                "Link do okładki": f"https://directory.doabooks.org/handle/{book.get('handle')}"
+            }
         return None
-    except: return None
+    except Exception as e:
+        return None
 
-# --- LOGIKA KASKADOWA (PRIORYTETOWANIE) ---
+# --- LOGIKA KASKADOWA ---
 def get_book_data_cascading(isbn):
-    # 1. ELIBRI (Najwyższy priorytet)
-    url_el = f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}"
+    # 1. ELIBRI
     try:
-        r = requests.get(url_el, auth=(ELIBRI_USER, ELIBRI_PASS), timeout=10)
+        r = requests.get(f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}", 
+                         auth=(ELIBRI_USER, ELIBRI_PASS), timeout=10)
         if r.status_code == 200:
             data = parse_onix_data(r.content)
             if data and data.get("Tytuł") != "Brak tytułu":
@@ -220,61 +202,49 @@ def get_book_data_cascading(isbn):
 
     # 2. OPENLIBRARY
     ol_data = fetch_open_library(isbn)
-    if ol_data:
-        return ol_data, "OpenLibrary"
+    if ol_data: return ol_data, "OpenLibrary"
 
     # 3. DOAB
     doab_data = fetch_doab(isbn)
-    if doab_data:
-        return doab_data, "DOAB"
+    if doab_data: return doab_data, "DOAB"
 
     return None, "Nie znaleziono"
 
-# --- INTERFEJS STREAMLIT ---
-st.title("📖 Bibliotekarz Pro V3 (eLibri -> OL -> DOAB)")
+# --- UI STREAMLIT ---
+st.title("📖 Bibliotekarz Pro 2.0 (eLibri ➔ OL ➔ DOAB)")
 
-uploaded_file = st.file_uploader("Załaduj plik Excel z kolumną ISBN", type=["xlsx"])
+uploaded_file = st.file_uploader("Załaduj plik Excel z ISBN", type=["xlsx"])
 
 if uploaded_file:
     df_in = pd.read_excel(uploaded_file)
-    target_col = st.selectbox("Wybierz kolumnę z numerami ISBN:", df_in.columns)
+    target_col = st.selectbox("Kolumna z ISBN:", df_in.columns)
     
-    if st.button("Pobierz dane (Kaskadowo)"):
+    if st.button("Uruchom Pobieranie"):
         final_data = []
-        progress_bar = st.progress(0)
+        progress = st.progress(0)
         
-        # Definicja stałych nagłówków dla zachowania standardu
-        headers = [
-            "Tytuł", "Autorzy", "Autorzy (Nazwisko Imię)", "Oprawa", "Język", "Kategoria", 
-            "Data premiery", "Seria", "Opis wydania", "Wydawca", "Imprint", 
-            "Liczba stron", "ISBN-13", "Cena", "Opis", "Link do okładki"
-        ]
+        headers = ["Tytuł", "Autorzy", "Autorzy (Nazwisko Imię)", "Oprawa", "Język", "Kategoria", 
+                   "Data premiery", "Seria", "Opis wydania", "Wydawca", "Imprint", 
+                   "Liczba stron", "ISBN-13", "Cena", "Opis", "Link do okładki"]
         
         for i, row in df_in.iterrows():
-            isbn_raw = str(row[target_col]).split('.')[0].strip()
+            isbn = str(row[target_col]).split('.')[0].strip()
+            book_info, source = get_book_data_cascading(isbn)
             
-            # Pobieranie danych z zachowaniem priorytetów
-            book_info, source = get_book_data_cascading(isbn_raw)
-            
-            entry = {"Identyfikator": isbn_raw, "Źródło": source}
-            
-            # Wypełnianie kolumn danymi lub informacją o braku
+            entry = {"Identyfikator": isbn, "Źródło": source}
             for h in headers:
-                if book_info:
-                    entry[h] = book_info.get(h, "Brak")
-                else:
-                    entry[h] = "Brak danych"
+                entry[h] = book_info.get(h, "Brak") if book_info else "Brak"
             
             final_data.append(entry)
-            progress_bar.progress((i + 1) / len(df_in))
+            progress.progress((i + 1) / len(df_in))
             time.sleep(0.1)
 
         st.session_state.results_df = pd.DataFrame(final_data)
-        st.success("Przetwarzanie zakończone sukcesem!")
+        st.success("Zakończono pobieranie!")
 
 if 'results_df' in st.session_state:
     st.dataframe(st.session_state.results_df)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
         st.session_state.results_df.to_excel(writer, index=False)
-    st.download_button("📥 Pobierz kompletny raport Excel", buf.getvalue(), "raport_ksiazek_v3.xlsx")
+    st.download_button("📥 Pobierz Excel", buf.getvalue(), "raport_ksiazek.xlsx")
