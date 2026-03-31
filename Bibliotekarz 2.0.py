@@ -10,34 +10,6 @@ import xml.etree.ElementTree as ET
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="Bibliotekarz Pro", page_icon="📖", layout="wide")
 
-# --- INTEGRACJA GA4 ---
-GOOGLE_ANALYTICS_ID = "G-EYLDFL816H"
-
-def inject_ga(ga_id):
-    if ga_id.startswith("G-XXXX"): return 
-    js = f"""
-    <script>
-    var parentHead = window.parent.document.head;
-    if (!parentHead.querySelector('script[src*="gtag/js?id={ga_id}"]')) {{
-        var script = window.parent.document.createElement('script');
-        script.async = true;
-        script.src = 'https://www.googletagmanager.com/gtag/js?id={ga_id}';
-        parentHead.appendChild(script);
-        var script2 = window.parent.document.createElement('script');
-        script2.innerHTML = `
-            window.parent.dataLayer = window.parent.dataLayer || [];
-            function gtag(){{window.parent.dataLayer.push(arguments);}}
-            gtag('js', new Date());
-            gtag('config', '{ga_id}');
-        `;
-        parentHead.appendChild(script2);
-    }}
-    </script>
-    """
-    st.components.v1.html(js, height=0, width=0)
-
-inject_ga(GOOGLE_ANALYTICS_ID)
-
 # --- SŁOWNIK JĘZYKÓW ---
 LANG_MAP = {
     "pol": "polski", "eng": "angielski", "ger": "niemiecki",
@@ -45,7 +17,7 @@ LANG_MAP = {
     "spa": "hiszpański", "lat": "łacina", "cze": "czeski", "ukr": "ukraiński"
 }
 
-# --- POŚWIADCZENIA ---
+# --- POBIERANIE POŚWIADCZEŃ ---
 try:
     ELIBRI_USER = st.secrets["elibri"]["username"]
     ELIBRI_PASS = st.secrets["elibri"]["password"]
@@ -77,7 +49,7 @@ def format_date(date_str):
         return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
     return date_str
 
-# --- PARSER ONIX (ELIBRI) ---
+# --- 1. PEŁNY PARSER ONIX (ELIBRI) ---
 def parse_onix_data(xml_content):
     try:
         xml_content_str = xml_content.decode('utf-8') if isinstance(xml_content, bytes) else xml_content
@@ -149,7 +121,7 @@ def parse_onix_data(xml_content):
         }
     except Exception: return None
 
-# --- OBSŁUGA OPEN LIBRARY ---
+# --- 2. OBSŁUGA OPEN LIBRARY ---
 def fetch_open_library(isbn):
     try:
         url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
@@ -159,22 +131,20 @@ def fetch_open_library(isbn):
             key = f"ISBN:{isbn}"
             if key in data:
                 b = data[key]
+                auth_list = [a.get('name') for a in b.get('authors', [])]
+                authors_str = ", ".join(auth_list) if auth_list else "Nieznany"
                 
-                # Standaryzacja autorów
-                authors = [a.get('name') for a in b.get('authors', [])]
-                authors_str = ", ".join(authors) if authors else "Nieznany"
-                
-                # Standaryzacja języka
-                langs = b.get('subjects', []) # OpenLibrary często trzyma język w subjects lub oddzielnie
-                # Jeśli API nie zwraca jasnego kodu języka, ustawiamy "Brak / Angielski (OL)"
-                
+                # Próba wyciągnięcia opisu (OL ma różną strukturę dla opisu)
+                desc = b.get('notes', "Brak opisu")
+                if isinstance(desc, dict): desc = desc.get('value', "Brak opisu")
+
                 return {
                     "Tytuł": b.get('title', "Brak tytułu"),
                     "Autorzy": authors_str,
                     "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
                     "Oprawa": "Brak danych (OL)",
                     "Język": "Brak danych (OL)",
-                    "Kategoria": " | ".join([s.get('name') for s in b.get('subjects', [])[:3]]) if b.get('subjects') else "Brak",
+                    "Kategoria": " | ".join([s.get('name') for s in b.get('subjects', [])[:3]]) if b.get('subjects') else "Baza OL",
                     "Data premiery": b.get('publish_date', "Brak daty"),
                     "Seria": "Brak danych (OL)",
                     "Opis wydania": "Brak danych (OL)",
@@ -182,73 +152,63 @@ def fetch_open_library(isbn):
                     "Imprint": "Brak",
                     "Liczba stron": str(b.get('number_of_pages', "Brak")),
                     "ISBN-13": isbn,
-                    "Cena": "Nie dotyczy (OL)",
-                    "Opis": b.get('notes', "Brak opisu"),
+                    "Cena": "n/d",
+                    "Opis": desc,
                     "Link do okładki": b.get('cover', {}).get('large', "Brak okładki")
                 }
         return None
     except: return None
 
-# --- GŁÓWNA LOGIKA POBIERANIA ---
-def get_book_data(isbn):
-    # 1. Próba eLibri
-    url_elibri = f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}"
+# --- 3. OBSŁUGA DOAB ---
+def fetch_doab(isbn):
     try:
-        r = requests.get(url_elibri, auth=(ELIBRI_USER, ELIBRI_PASS), timeout=10)
+        url = f"https://directory.doabooks.org/rest/search?query=dc.identifier.isbn:{isbn}"
+        headers = {'Accept': 'application/json'}
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
-            data = parse_onix_data(r.content)
-            if data: return data, "eLibri"
-    except: pass
+            results = r.json()
+            if results:
+                book = results[0]
+                meta_list = book.get('metadata', [])
+                metadata = {}
+                # DOAB metadata to lista słowników, robimy z tego mapę dla wygody
+                for m in meta_list:
+                    key = m.get('key')
+                    val = m.get('value')
+                    if key not in metadata: metadata[key] = []
+                    metadata[key].append(val)
 
-    # 2. Próba OpenLibrary
-    ol_data = fetch_open_library(isbn)
-    if ol_data:
-        return ol_data, "OpenLibrary"
-    
-    return None, "Brak"
+                title = metadata.get('dc.title', ["Brak tytułu"])[0]
+                authors = metadata.get('dc.contributor.author', ["Nieznany"])
+                authors_str = ", ".join(authors)
+                publisher = metadata.get('dc.publisher', ["Brak"])[0]
+                date = metadata.get('dc.date.issued', ["Brak"])[0]
+                desc = metadata.get('dc.description.abstract', ["Brak opisu"])[0]
 
-# --- UI STREAMLIT ---
-st.title("📖 Multibaza Książkowa (eLibri + OpenLibrary)")
+                return {
+                    "Tytuł": title,
+                    "Autorzy": authors_str,
+                    "Autorzy (Nazwisko Imię)": reverse_authors(authors_str),
+                    "Oprawa": "Digital (OA)",
+                    "Język": "Brak danych (DOAB)",
+                    "Kategoria": "Open Access / DOAB",
+                    "Data premiery": date,
+                    "Seria": "Brak",
+                    "Opis wydania": "Open Access",
+                    "Wydawca": publisher,
+                    "Imprint": "Brak",
+                    "Liczba stron": "Brak",
+                    "ISBN-13": isbn,
+                    "Cena": "0.00",
+                    "Opis": desc,
+                    "Link do okładki": f"https://directory.doabooks.org/handle/{book.get('handle')}"
+                }
+        return None
+    except: return None
 
-uploaded_file = st.file_uploader("Załaduj plik Excel z kolumną ISBN", type=["xlsx"])
-
-if uploaded_file:
-    df_in = pd.read_excel(uploaded_file)
-    target_col = st.selectbox("Wybierz kolumnę z numerami ISBN:", df_in.columns)
-    
-    if st.button("Pobierz dane z API"):
-        final_data = []
-        progress_bar = st.progress(0)
-        
-        headers = [
-            "Tytuł", "Autorzy", "Autorzy (Nazwisko Imię)", "Oprawa", "Język", "Kategoria", 
-            "Data premiery", "Seria", "Opis wydania", "Wydawca", "Imprint", 
-            "Liczba stron", "ISBN-13", "Cena", "Opis", "Link do okładki"
-        ]
-        
-        for i, row in df_in.iterrows():
-            isbn_raw = str(row[target_col]).split('.')[0].strip()
-            
-            book_info, source = get_book_data(isbn_raw)
-            
-            entry = {"Identyfikator": isbn_raw, "Źródło danych": source}
-            
-            for h in headers:
-                if book_info:
-                    entry[h] = book_info.get(h, "Brak")
-                else:
-                    entry[h] = "Nie znaleziono w żadnej bazie"
-            
-            final_data.append(entry)
-            progress_bar.progress((i + 1) / len(df_in))
-            time.sleep(0.1) # Lekki throttle dla API
-
-        st.session_state.results_df = pd.DataFrame(final_data)
-        st.success("Przetwarzanie zakończone!")
-
-if 'results_df' in st.session_state:
-    st.dataframe(st.session_state.results_df)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-        st.session_state.results_df.to_excel(writer, index=False)
-    st.download_button("📥 Pobierz kompletny Excel", buf.getvalue(), "rejestr_ksiazek.xlsx")
+# --- LOGIKA KASKADOWA (PRIORYTETOWANIE) ---
+def get_book_data_cascading(isbn):
+    # 1. ELIBRI (Najwyższy priorytet)
+    url_el = f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}"
+    try:
+        r = requests.get(url_el, auth=(ELIBRI_USER,
