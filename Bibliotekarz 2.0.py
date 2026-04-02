@@ -14,28 +14,41 @@ st.set_page_config(page_title="Bibliotekarz Pro", page_icon="📖", layout="wide
 GOOGLE_ANALYTICS_ID = "G-EYZS8WJRXY"
 
 def inject_ga(ga_id):
+    """Wstrzykuje kod śledzący GA4 do aplikacji."""
     if ga_id.startswith("G-XXXX"): return 
+    
+    # Używamy standardowego wstrzykiwania do head poprzez iframe components
     js = f"""
+    <script async src="https://www.googletagmanager.com/gtag/js?id={ga_id}"></script>
     <script>
-    var parentHead = window.parent.document.head;
-    if (!parentHead.querySelector('script[src*="gtag/js?id={ga_id}"]')) {{
-        var script = window.parent.document.createElement('script');
-        script.async = true;
-        script.src = 'https://www.googletagmanager.com/gtag/js?id={ga_id}';
-        parentHead.appendChild(script);
-        var script2 = window.parent.document.createElement('script');
-        script2.innerHTML = `
-            window.parent.dataLayer = window.parent.dataLayer || [];
-            function gtag(){{window.parent.dataLayer.push(arguments);}}
-            gtag('js', new Date());
-            gtag('config', '{ga_id}');
-        `;
-        parentHead.appendChild(script2);
-    }}
+        window.parent.dataLayer = window.parent.dataLayer || [];
+        function gtag(){{window.parent.dataLayer.push(arguments);}}
+        gtag('js', new Date());
+        gtag('config', '{ga_id}', {{
+            'page_path': window.parent.location.pathname,
+            'cookie_flags': 'SameSite=None;Secure'
+        }});
+        
+        // Funkcja dostępna globalnie dla track_event
+        window.parent.gtag = gtag;
     </script>
     """
-    st.components.v1.html(js, height=0, width=0)
+    st.components.v1.html(js, height=0)
 
+def track_event(event_name, params=None):
+    """Wysyła zdarzenie do GA4."""
+    if params is None: params = {}
+    params_json = json.dumps(params)
+    js = f"""
+    <script>
+        if (window.parent.gtag) {{
+            window.parent.gtag('event', '{event_name}', {params_json});
+        }}
+    </script>
+    """
+    st.components.v1.html(js, height=0)
+
+# Inicjalizacja GA4
 inject_ga(GOOGLE_ANALYTICS_ID)
 
 # --- SŁOWNIK JĘZYKÓW ---
@@ -53,7 +66,7 @@ except Exception:
     st.error("❌ Brak konfiguracji Secrets (elibri.username / elibri.password)")
     st.stop()
 
-# --- FUNKCJE POMOCNICZE ---
+# --- FUNKCJE POMOCNICZE (bez zmian) ---
 def reverse_authors(authors_str):
     if not authors_str or authors_str in ["Nieznany", "Brak", "Błąd danych"]:
         return authors_str
@@ -159,15 +172,8 @@ def fetch_open_library(isbn):
             key = f"ISBN:{isbn}"
             if key in data:
                 b = data[key]
-                
-                # Standaryzacja autorów
                 authors = [a.get('name') for a in b.get('authors', [])]
                 authors_str = ", ".join(authors) if authors else "Nieznany"
-                
-                # Standaryzacja języka
-                langs = b.get('subjects', []) # OpenLibrary często trzyma język w subjects lub oddzielnie
-                # Jeśli API nie zwraca jasnego kodu języka, ustawiamy "Brak / Angielski (OL)"
-                
                 return {
                     "Tytuł": b.get('title', "Brak tytułu"),
                     "Autorzy": authors_str,
@@ -191,7 +197,6 @@ def fetch_open_library(isbn):
 
 # --- GŁÓWNA LOGIKA POBIERANIA ---
 def get_book_data(isbn):
-    # 1. Próba eLibri
     url_elibri = f"https://www.elibri.com.pl/distributors/empik/by_isbn/{isbn}"
     try:
         r = requests.get(url_elibri, auth=(ELIBRI_USER, ELIBRI_PASS), timeout=10)
@@ -200,7 +205,6 @@ def get_book_data(isbn):
             if data: return data, "eLibri"
     except: pass
 
-    # 2. Próba OpenLibrary
     ol_data = fetch_open_library(isbn)
     if ol_data:
         return ol_data, "OpenLibrary"
@@ -217,6 +221,9 @@ if uploaded_file:
     target_col = st.selectbox("Wybierz kolumnę z numerami ISBN:", df_in.columns)
     
     if st.button("Pobierz dane z API"):
+        # ŚLEDZENIE: Rozpoczęcie pobierania
+        track_event("api_request_start", {"row_count": len(df_in)})
+        
         final_data = []
         progress_bar = st.progress(0)
         
@@ -228,9 +235,7 @@ if uploaded_file:
         
         for i, row in df_in.iterrows():
             isbn_raw = str(row[target_col]).split('.')[0].strip()
-            
             book_info, source = get_book_data(isbn_raw)
-            
             entry = {"Identyfikator": isbn_raw, "Źródło danych": source}
             
             for h in headers:
@@ -241,14 +246,20 @@ if uploaded_file:
             
             final_data.append(entry)
             progress_bar.progress((i + 1) / len(df_in))
-            time.sleep(0.1) # Lekki throttle dla API
+            time.sleep(0.1)
 
         st.session_state.results_df = pd.DataFrame(final_data)
         st.success("Przetwarzanie zakończone!")
+        
+        # ŚLEDZENIE: Zakończenie sukcesem
+        track_event("api_request_success", {"processed_items": len(final_data)})
 
 if 'results_df' in st.session_state:
     st.dataframe(st.session_state.results_df)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
         st.session_state.results_df.to_excel(writer, index=False)
-    st.download_button("📥 Pobierz kompletny Excel", buf.getvalue(), "rejestr_ksiazek.xlsx")
+    
+    if st.download_button("📥 Pobierz kompletny Excel", buf.getvalue(), "rejestr_ksiazek.xlsx"):
+        # ŚLEDZENIE: Pobranie pliku
+        track_event("file_downloaded")
