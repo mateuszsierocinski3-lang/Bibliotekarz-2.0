@@ -8,13 +8,13 @@ import json
 import xml.etree.ElementTree as ET
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Bibliotekarz Pro", page_icon="📖", layout="wide")
+st.set_page_config(page_title="Bibliotekarz 2.0", page_icon="📖", layout="wide")
 
 # --- INTEGRACJA GOOGLE ANALYTICS 4 ---
 GOOGLE_ANALYTICS_ID = "G-EYLDFL816H"
 
 def inject_ga(ga_id):
-    if ga_id.startswith("G-EYLDFL816H"): return 
+    if ga_id.startswith("G-XXXX"): return 
     js = f"""
     <script>
     var parentHead = window.parent.document.head;
