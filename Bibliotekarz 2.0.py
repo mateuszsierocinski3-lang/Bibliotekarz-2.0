@@ -10,45 +10,57 @@ import xml.etree.ElementTree as ET
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="Bibliotekarz Pro", page_icon="📖", layout="wide")
 
-# --- INTEGRACJA GA4 ---
+# --- INTEGRACJA GA4 (ZGODNIE Z KROKIEM 1 i 2) ---
+# Twój ID z GA4
 GOOGLE_ANALYTICS_ID = "G-EYZS8WJRXY"
 
 def inject_ga(ga_id):
-    """Wstrzykuje kod śledzący GA4 do aplikacji."""
+    """
+    Wstrzykuje bibliotekę GA4 do głównego okna przeglądarki (window.parent).
+    Uruchamia się tylko raz, sprawdzając czy skrypt już istnieje.
+    """
     if ga_id.startswith("G-XXXX"): return 
-    
-    # Używamy standardowego wstrzykiwania do head poprzez iframe components
     js = f"""
-    <script async src="https://www.googletagmanager.com/gtag/js?id={ga_id}"></script>
     <script>
-        window.parent.dataLayer = window.parent.dataLayer || [];
-        function gtag(){{window.parent.dataLayer.push(arguments);}}
-        gtag('js', new Date());
-        gtag('config', '{ga_id}', {{
-            'page_path': window.parent.location.pathname,
-            'cookie_flags': 'SameSite=None;Secure'
-        }});
+    var parentHead = window.parent.document.head;
+    if (!parentHead.querySelector('script[src*="gtag/js?id={ga_id}"]')) {{
+        console.log('Injecting GA4 into parent window...');
+        var script = window.parent.document.createElement('script');
+        script.async = true;
+        script.src = 'https://www.googletagmanager.com/gtag/js?id={ga_id}';
+        parentHead.appendChild(script);
         
-        // Funkcja dostępna globalnie dla track_event
-        window.parent.gtag = gtag;
+        var script2 = window.parent.document.createElement('script');
+        script2.innerHTML = `
+            window.parent.dataLayer = window.parent.dataLayer || [];
+            function gtag(){{window.parent.dataLayer.push(arguments);}}
+            gtag('js', new Date());
+            gtag('config', '{ga_id}');
+            window.parent.gtag = gtag;
+        `;
+        parentHead.appendChild(script2);
+    }}
     </script>
     """
-    st.components.v1.html(js, height=0)
+    st.components.v1.html(js, height=0, width=0)
 
 def track_event(event_name, params=None):
-    """Wysyła zdarzenie do GA4."""
+    """
+    Wysyła zdarzenie do GA4 znajdującego się w oknie rodzica.
+    """
     if params is None: params = {}
     params_json = json.dumps(params)
     js = f"""
     <script>
-        if (window.parent.gtag) {{
-            window.parent.gtag('event', '{event_name}', {params_json});
-        }}
+    if (window.parent.gtag) {{
+        window.parent.gtag('event', '{event_name}', {params_json});
+        console.log('Event sent to parent GA:', '{event_name}');
+    }}
     </script>
     """
-    st.components.v1.html(js, height=0)
+    st.components.v1.html(js, height=0, width=0)
 
-# Inicjalizacja GA4
+# Inicjalizacja GA4 zaraz po konfiguracji strony
 inject_ga(GOOGLE_ANALYTICS_ID)
 
 # --- SŁOWNIK JĘZYKÓW ---
@@ -60,13 +72,14 @@ LANG_MAP = {
 
 # --- POŚWIADCZENIA ---
 try:
+    # Dane pobierane z sekcji Secrets zgodnie z Twoją konfiguracją
     ELIBRI_USER = st.secrets["elibri"]["username"]
     ELIBRI_PASS = st.secrets["elibri"]["password"]
 except Exception:
     st.error("❌ Brak konfiguracji Secrets (elibri.username / elibri.password)")
     st.stop()
 
-# --- FUNKCJE POMOCNICZE (bez zmian) ---
+# --- FUNKCJE POMOCNICZE ---
 def reverse_authors(authors_str):
     if not authors_str or authors_str in ["Nieznany", "Brak", "Błąd danych"]:
         return authors_str
@@ -221,8 +234,12 @@ if uploaded_file:
     target_col = st.selectbox("Wybierz kolumnę z numerami ISBN:", df_in.columns)
     
     if st.button("Pobierz dane z API"):
-        # ŚLEDZENIE: Rozpoczęcie pobierania
-        track_event("api_request_start", {"row_count": len(df_in)})
+        # ŚLEDZENIE: Rozpoczęcie procesu
+        track_event("file_processed", {
+            "file_name": uploaded_file.name,
+            "row_count": len(df_in),
+            "status": "started"
+        })
         
         final_data = []
         progress_bar = st.progress(0)
@@ -252,7 +269,9 @@ if uploaded_file:
         st.success("Przetwarzanie zakończone!")
         
         # ŚLEDZENIE: Zakończenie sukcesem
-        track_event("api_request_success", {"processed_items": len(final_data)})
+        track_event("file_processed_success", {
+            "processed_items": len(final_data)
+        })
 
 if 'results_df' in st.session_state:
     st.dataframe(st.session_state.results_df)
@@ -261,5 +280,5 @@ if 'results_df' in st.session_state:
         st.session_state.results_df.to_excel(writer, index=False)
     
     if st.download_button("📥 Pobierz kompletny Excel", buf.getvalue(), "rejestr_ksiazek.xlsx"):
-        # ŚLEDZENIE: Pobranie pliku
-        track_event("file_downloaded")
+        # ŚLEDZENIE: Pobranie raportu
+        track_event("report_downloaded")
