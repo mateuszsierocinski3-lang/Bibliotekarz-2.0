@@ -14,7 +14,7 @@ st.set_page_config(page_title="Bibliotekarz Pro", page_icon="📖", layout="wide
 GOOGLE_ANALYTICS_ID = "G-EYLDFL816H"
 
 def inject_ga(ga_id):
-    if ga_id.startswith("G-XXXX"): return 
+    if ga_id.startswith("G-EYLDFL816H"): return 
     js = f"""
     <script>
     var parentHead = window.parent.document.head;
