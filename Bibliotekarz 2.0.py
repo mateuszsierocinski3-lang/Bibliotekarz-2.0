@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 st.set_page_config(page_title="Bibliotekarz Pro", page_icon="📖", layout="wide")
 
 # --- INTEGRACJA GA4 ---
-GOOGLE_ANALYTICS_ID = "G-EYLDFL816H"
+GOOGLE_ANALYTICS_ID = "G-EYZS8WJRXY"
 
 def inject_ga(ga_id):
     if ga_id.startswith("G-XXXX"): return 
